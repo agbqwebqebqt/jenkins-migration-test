@@ -1,0 +1,112 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'ENVIRONMENT', choices: ['staging', 'production'], description: 'Target environment')
+        string(name: 'IMAGE_TAG', defaultValue: '', description: 'Docker image tag to deploy')
+        booleanParam(name: 'DRY_RUN', defaultValue: false, description: 'Dry run mode')
+    }
+
+    environment {
+        DOCKER_REGISTRY = 'registry.company.com'
+        APP_NAME = 'web-frontend'
+        SLACK_CHANNEL = '#deployments'
+    }
+
+    options {
+        timeout(time: 20, unit: 'MINUTES')
+        timestamps()
+    }
+
+    stages {
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    if (params.IMAGE_TAG == '') {
+                        error('IMAGE_TAG parameter is required')
+                    }
+                    echo "Deploying ${env.APP_NAME}:${params.IMAGE_TAG} to ${params.ENVIRONMENT}"
+                }
+            }
+        }
+
+        stage('Approval') {
+            when {
+                expression { params.ENVIRONMENT == 'production' && !params.DRY_RUN }
+            }
+            steps {
+                input(
+                    message: "Deploy ${params.IMAGE_TAG} to PRODUCTION?",
+                    ok: 'Deploy',
+                    submitter: 'ops-team,lead-devs'
+                )
+            }
+        }
+
+        stage('Pre-deploy Health Check') {
+            steps {
+                withCredentials([file(credentialsId: "kubeconfig-${params.ENVIRONMENT}", variable: 'KUBECONFIG')]) {
+                    sh "kubectl get nodes"
+                    sh "kubectl get pods -n ${params.ENVIRONMENT} -l app=${env.APP_NAME}"
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                script {
+                    def kubeconfigCred = "kubeconfig-${params.ENVIRONMENT}"
+                    def imageTag = "${env.DOCKER_REGISTRY}/${env.APP_NAME}:${params.IMAGE_TAG}"
+
+                    if (params.DRY_RUN) {
+                        echo "DRY RUN: Would deploy ${imageTag} to ${params.ENVIRONMENT}"
+                    } else {
+                        withCredentials([file(credentialsId: kubeconfigCred, variable: 'KUBECONFIG')]) {
+                            sh "kubectl set image deployment/${env.APP_NAME} ${env.APP_NAME}=${imageTag} -n ${params.ENVIRONMENT}"
+                            sh "kubectl rollout status deployment/${env.APP_NAME} -n ${params.ENVIRONMENT} --timeout=300s"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Post-deploy Verification') {
+            when {
+                expression { !params.DRY_RUN }
+            }
+            steps {
+                withCredentials([file(credentialsId: "kubeconfig-${params.ENVIRONMENT}", variable: 'KUBECONFIG')]) {
+                    sh "kubectl get pods -n ${params.ENVIRONMENT} -l app=${env.APP_NAME}"
+                    sh "kubectl exec -n ${params.ENVIRONMENT} deploy/${env.APP_NAME} -- curl -sf http://localhost:3000/health || exit 1"
+                }
+            }
+        }
+
+        stage('Smoke Tests') {
+            when {
+                expression { !params.DRY_RUN }
+            }
+            steps {
+                sh "curl -sf https://${params.ENVIRONMENT}.company.com/api/health || exit 1"
+                sh "curl -sf https://${params.ENVIRONMENT}.company.com/ | grep -q 'Web Frontend'"
+            }
+        }
+    }
+
+    post {
+        success {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'good',
+                message: "Deployed ${env.APP_NAME}:${params.IMAGE_TAG} to ${params.ENVIRONMENT} successfully"
+            )
+        }
+        failure {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'danger',
+                message: "FAILED to deploy ${env.APP_NAME}:${params.IMAGE_TAG} to ${params.ENVIRONMENT}"
+            )
+        }
+    }
+}

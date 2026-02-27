@@ -1,0 +1,91 @@
+pipeline {
+    agent {
+        docker {
+            image 'node:18-alpine'
+        }
+    }
+
+    environment {
+        CI = 'true'
+        BASE_URL = "https://staging.company.com"
+        BROWSERSTACK_USER = credentials('browserstack-user')
+        BROWSERSTACK_KEY = credentials('browserstack-key')
+    }
+
+    options {
+        timeout(time: 45, unit: 'MINUTES')
+        timestamps()
+    }
+
+    triggers {
+        cron('0 6 * * 1-5')  // Weekdays at 6 AM
+    }
+
+    stages {
+        stage('Setup') {
+            steps {
+                sh 'npm ci'
+            }
+        }
+
+        stage('E2E Tests') {
+            parallel {
+                stage('Chrome') {
+                    steps {
+                        sh 'npx nightwatch --env chrome --reporter junit'
+                    }
+                    post {
+                        always {
+                            junit 'reports/chrome/**/*.xml'
+                        }
+                    }
+                }
+                stage('Firefox') {
+                    steps {
+                        sh 'npx nightwatch --env firefox --reporter junit'
+                    }
+                    post {
+                        always {
+                            junit 'reports/firefox/**/*.xml'
+                        }
+                    }
+                }
+                stage('Safari') {
+                    steps {
+                        sh 'npx nightwatch --env safari.browserstack --reporter junit'
+                    }
+                    post {
+                        always {
+                            junit 'reports/safari/**/*.xml'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Generate Report') {
+            steps {
+                sh 'npx nightwatch-html-reporter --report-dir reports/html'
+                publishHTML(target: [
+                    reportDir: 'reports/html',
+                    reportFiles: 'index.html',
+                    reportName: 'E2E Test Report'
+                ])
+            }
+        }
+    }
+
+    post {
+        failure {
+            slackSend(
+                channel: '#qa-alerts',
+                color: 'danger',
+                message: "E2E Tests FAILED - ${env.BUILD_URL}"
+            )
+        }
+        always {
+            archiveArtifacts artifacts: 'reports/**/*', allowEmptyArchive: true
+            cleanWs()
+        }
+    }
+}
