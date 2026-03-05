@@ -1,0 +1,201 @@
+# =============================================================================
+# Deploy Workflow — migrated from deploy/Jenkinsfile
+#
+# Original pipeline: deploy/Jenkinsfile (declarative, parameterized)
+# Shared libraries expanded inline:
+#   - vars/notifySlack.groovy  → "Notify Slack" steps
+#
+# KEY MIGRATION NOTES:
+#   - Jenkins `parameters { choice/string/booleanParam }` → workflow_dispatch inputs
+#   - Jenkins `input(message, submitter: 'ops-team,lead-devs')` production approval gate
+#     → GitHub Environment protection rules on the "production" environment.
+#     Configure required reviewers in: Settings → Environments → production
+#     Add teams/users: ops-team, lead-devs
+#   - Jenkins file-credential `kubeconfig-${ENVIRONMENT}` → KUBECONFIG_STAGING /
+#     KUBECONFIG_PRODUCTION secrets (base64-encoded kubeconfig file content)
+#
+# SECURITY NOTE: Pin all `@vN` action refs to full commit SHAs before production.
+# =============================================================================
+
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        # Mirrors Jenkins: choice(name: 'ENVIRONMENT', choices: ['staging', 'production'])
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      image_tag:
+        # Mirrors Jenkins: string(name: 'IMAGE_TAG', defaultValue: '', description: '...')
+        description: "Docker image tag to deploy (e.g. 42 or v1.2.3)"
+        required: true
+        type: string
+      dry_run:
+        # Mirrors Jenkins: booleanParam(name: 'DRY_RUN', defaultValue: false)
+        description: "Dry run mode — validate without making changes"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  DOCKER_REGISTRY: registry.company.com
+  APP_NAME: web-frontend
+
+# Deny all GITHUB_TOKEN permissions at workflow level; no job in this workflow
+# needs to read repository contents or write to any GitHub resource — all actions
+# are against external systems (kubectl / Slack) using repository secrets.
+permissions: {}
+
+# ---------------------------------------------------------------------------
+# Job: validate
+# Mirrors Jenkins stage('Validate Parameters')
+# ---------------------------------------------------------------------------
+jobs:
+  validate:
+    name: Validate Parameters
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      # Mirrors: if (params.IMAGE_TAG == '') { error('IMAGE_TAG parameter is required') }
+      - name: Validate IMAGE_TAG is provided
+        run: |
+          if [ -z "${{ inputs.image_tag }}" ]; then
+            echo "::error::image_tag parameter is required"
+            exit 1
+          fi
+          echo "✔ Deploying ${{ env.APP_NAME }}:${{ inputs.image_tag }} to ${{ inputs.environment }}"
+          echo "  dry_run=${{ inputs.dry_run }}"
+
+  # ---------------------------------------------------------------------------
+  # Job: deploy
+  # Mirrors Jenkins stage('Approval') + stage('Pre-deploy Health Check') +
+  #   stage('Deploy') + stage('Post-deploy Verification') + stage('Smoke Tests')
+  #
+  # The `environment:` key implements the Jenkins `input()` approval gate:
+  #   - For "staging"    → no protection rules required (deploy immediately)
+  #   - For "production" → configure required reviewers in GitHub Environment settings
+  #     (Settings → Environments → production → Required reviewers: ops-team, lead-devs)
+  #     This replaces: input(message: "...", submitter: 'ops-team,lead-devs')
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    needs: validate
+    timeout-minutes: 20
+    # Dynamic environment reference — triggers protection rules for "production"
+    environment: ${{ inputs.environment }}
+    permissions: {}
+    steps:
+      # -----------------------------------------------------------------------
+      # Configure kubeconfig — mirrors:
+      #   withCredentials([file(credentialsId: "kubeconfig-${params.ENVIRONMENT}", variable: 'KUBECONFIG')])
+      # Two separate steps because GitHub Actions expressions cannot select
+      # between secrets dynamically (secret names must be literal).
+      # -----------------------------------------------------------------------
+      - name: Configure kubeconfig for staging
+        if: inputs.environment == 'staging'
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Configure kubeconfig for production
+        if: inputs.environment == 'production'
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      # -----------------------------------------------------------------------
+      # Mirrors Jenkins stage('Pre-deploy Health Check'):
+      #   sh "kubectl get nodes"
+      #   sh "kubectl get pods -n ${params.ENVIRONMENT} -l app=${env.APP_NAME}"
+      # -----------------------------------------------------------------------
+      - name: Pre-deploy health check
+        run: |
+          kubectl get nodes
+          kubectl get pods -n ${{ inputs.environment }} -l app=${{ env.APP_NAME }}
+
+      # -----------------------------------------------------------------------
+      # Mirrors Jenkins stage('Deploy') when DRY_RUN is true:
+      #   echo "DRY RUN: Would deploy ${imageTag} to ${params.ENVIRONMENT}"
+      # -----------------------------------------------------------------------
+      - name: Deploy — dry run (no changes made)
+        if: inputs.dry_run == true
+        run: |
+          IMAGE="${{ env.DOCKER_REGISTRY }}/${{ env.APP_NAME }}:${{ inputs.image_tag }}"
+          echo "DRY RUN: Would deploy ${IMAGE} to ${{ inputs.environment }}"
+
+      # -----------------------------------------------------------------------
+      # Mirrors Jenkins stage('Deploy') when DRY_RUN is false:
+      #   kubectl set image deployment/...
+      #   kubectl rollout status ... --timeout=300s
+      # -----------------------------------------------------------------------
+      - name: Deploy
+        if: inputs.dry_run == false
+        run: |
+          IMAGE="${{ env.DOCKER_REGISTRY }}/${{ env.APP_NAME }}:${{ inputs.image_tag }}"
+          kubectl set image deployment/${{ env.APP_NAME }} \
+            ${{ env.APP_NAME }}=${IMAGE} \
+            -n ${{ inputs.environment }}
+          kubectl rollout status deployment/${{ env.APP_NAME }} \
+            -n ${{ inputs.environment }} --timeout=300s
+
+      # -----------------------------------------------------------------------
+      # Mirrors Jenkins stage('Post-deploy Verification')
+      # when { expression { !params.DRY_RUN } }
+      # -----------------------------------------------------------------------
+      - name: Post-deploy verification
+        if: inputs.dry_run == false
+        run: |
+          kubectl get pods -n ${{ inputs.environment }} -l app=${{ env.APP_NAME }}
+          kubectl exec -n ${{ inputs.environment }} deploy/${{ env.APP_NAME }} -- \
+            curl -sf http://localhost:3000/health || exit 1
+
+      # -----------------------------------------------------------------------
+      # Mirrors Jenkins stage('Smoke Tests')
+      # when { expression { !params.DRY_RUN } }
+      # -----------------------------------------------------------------------
+      - name: Smoke tests
+        if: inputs.dry_run == false
+        run: |
+          curl -sf https://${{ inputs.environment }}.company.com/api/health || exit 1
+          curl -sf https://${{ inputs.environment }}.company.com/ | grep -q 'Web Frontend'
+
+      # -----------------------------------------------------------------------
+      # EXPANDED: vars/notifySlack.groovy — success notification
+      # Mirrors post { success { slackSend(channel: env.SLACK_CHANNEL, color: 'good', …) } }
+      # notifySlack logic: status=SUCCESS → emoji=':white_check_mark:', color='good'
+      # -----------------------------------------------------------------------
+      - name: Notify Slack — success
+        if: success()
+        uses: slackapi/slack-github-action@v1.27.0
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_DEPLOYMENTS }}
+        with:
+          payload: |
+            {
+              "text": ":white_check_mark: *${{ github.workflow }}* #${{ github.run_number }} - *SUCCESS*\nBranch: ${{ github.ref_name }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>\n\nDeployed ${{ env.APP_NAME }}:${{ inputs.image_tag }} to ${{ inputs.environment }} successfully"
+            }
+
+      # -----------------------------------------------------------------------
+      # EXPANDED: vars/notifySlack.groovy — failure notification
+      # Mirrors post { failure { slackSend(channel: env.SLACK_CHANNEL, color: 'danger', …) } }
+      # notifySlack logic: status=FAILURE → emoji=':x:', color='danger'
+      # -----------------------------------------------------------------------
+      - name: Notify Slack — failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.27.0
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_DEPLOYMENTS }}
+        with:
+          payload: |
+            {
+              "text": ":x: *${{ github.workflow }}* #${{ github.run_number }} - *FAILURE*\nBranch: ${{ github.ref_name }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>\n\nFAILED to deploy ${{ env.APP_NAME }}:${{ inputs.image_tag }} to ${{ inputs.environment }}"
+            }

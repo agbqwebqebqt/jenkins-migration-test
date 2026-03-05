@@ -1,0 +1,205 @@
+# =============================================================================
+# E2E Tests Workflow — migrated from nightwatch/Jenkinsfile
+#
+# Original pipeline: nightwatch/Jenkinsfile (declarative, parallel stages)
+# Agent: docker { image 'node:18-alpine' }
+# Shared libraries expanded inline:
+#   - vars/notifySlack.groovy  → "Notify Slack" steps
+#
+# KEY MIGRATION NOTES:
+#   - Jenkins `triggers { cron('0 6 * * 1-5') }` → schedule cron (weekdays 6 AM UTC)
+#   - Jenkins parallel stages (Chrome/Firefox/Safari) → GitHub Actions matrix strategy
+#   - Chrome and Firefox run on ubuntu-latest (pre-installed browsers on GH runners)
+#   - Safari/BrowserStack runs as a separate matrix item using BROWSERSTACK_USER/KEY
+#   - Jenkins `publishHTML` (HTML Publisher plugin) → actions/upload-artifact
+#     (download the artifact from the Actions run summary page)
+#   - Jenkins `archiveArtifacts` → actions/upload-artifact
+#   - BrowserStack credentials: BROWSERSTACK_USER/KEY → GitHub Secrets
+#
+# SECURITY NOTE: Pin all `@vN` action refs to full commit SHAs before production.
+# =============================================================================
+
+name: E2E Tests
+
+on:
+  # Mirrors Jenkins: triggers { cron('0 6 * * 1-5') }  // Weekdays at 6 AM
+  schedule:
+    - cron: "0 6 * * 1-5"
+  # Allow manual triggering with no inputs (useful for on-demand runs)
+  workflow_dispatch:
+
+env:
+  BASE_URL: https://staging.company.com
+
+# Deny all GITHUB_TOKEN permissions at workflow level; each job grants only what it needs.
+permissions: {}
+
+# ---------------------------------------------------------------------------
+# Job: e2e-tests (matrix)
+# Mirrors Jenkins stage('E2E Tests') parallel { stage('Chrome') ... stage('Firefox') ...
+#   stage('Safari') ... }
+#
+# Matrix strategy replaces Jenkins parallel stages.
+# Each browser is a separate matrix entry; test results are uploaded per-browser.
+# Safari uses BrowserStack; Chrome and Firefox use the GH runner's local browsers.
+# ---------------------------------------------------------------------------
+jobs:
+  e2e-tests:
+    name: E2E Tests — ${{ matrix.browser }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      # Mirrors Jenkins parallel — all browsers run concurrently, none block others
+      fail-fast: false
+      matrix:
+        include:
+          # Mirrors Jenkins stage('Chrome'):
+          #   sh 'npx nightwatch --env chrome --reporter junit'
+          - browser: chrome
+            nightwatch_env: chrome
+            report_dir: reports/chrome
+            browserstack: false
+
+          # Mirrors Jenkins stage('Firefox'):
+          #   sh 'npx nightwatch --env firefox --reporter junit'
+          - browser: firefox
+            nightwatch_env: firefox
+            report_dir: reports/firefox
+            browserstack: false
+
+          # Mirrors Jenkins stage('Safari'):
+          #   sh 'npx nightwatch --env safari.browserstack --reporter junit'
+          - browser: safari
+            nightwatch_env: safari.browserstack
+            report_dir: reports/safari
+            browserstack: true
+
+    steps:
+      # Mirrors Jenkins stage('Setup'): sh 'npm ci'
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          # NPM_TOKEN for private registry access (if applicable)
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # Mirrors Jenkins parallel stage for each browser:
+      #   sh "npx nightwatch --env ${browser} --reporter junit"
+      # BrowserStack credentials (BROWSERSTACK_USER/KEY) are only injected when
+      # the matrix item targets BrowserStack (safari.browserstack env).
+      # -----------------------------------------------------------------------
+      - name: Run E2E tests — ${{ matrix.browser }}
+        run: npx nightwatch --env ${{ matrix.nightwatch_env }} --reporter junit
+        env:
+          CI: "true"
+          BASE_URL: ${{ env.BASE_URL }}
+          # Mirrors Jenkins credentials('browserstack-user') / credentials('browserstack-key')
+          # Only needed for BrowserStack runs; harmless if empty for local browsers.
+          BROWSERSTACK_USER: ${{ matrix.browserstack && secrets.BROWSERSTACK_USER || '' }}
+          BROWSERSTACK_KEY: ${{ matrix.browserstack && secrets.BROWSERSTACK_KEY || '' }}
+
+      # -----------------------------------------------------------------------
+      # Mirrors Jenkins post { always { junit "reports/${browser}/**/*.xml" } }
+      # -----------------------------------------------------------------------
+      - name: Upload JUnit test results — ${{ matrix.browser }}
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results-${{ matrix.browser }}
+          path: ${{ matrix.report_dir }}/**/*.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Job: generate-report
+  # Mirrors Jenkins stage('Generate Report'):
+  #   sh 'npx nightwatch-html-reporter --report-dir reports/html'
+  #   publishHTML(target: [reportDir: 'reports/html', reportFiles: 'index.html', …])
+  #
+  # Runs after all browser jobs complete (success or failure).
+  # Collects all per-browser XML artifacts, generates the consolidated HTML report,
+  # and uploads it as an artifact (replaces Jenkins HTML Publisher plugin).
+  # ---------------------------------------------------------------------------
+  generate-report:
+    name: Generate E2E HTML Report
+    runs-on: ubuntu-latest
+    needs: [e2e-tests]
+    # Mirrors Jenkins post { always { archiveArtifacts … } } — run even on test failure
+    if: always()
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Download all per-browser JUnit results uploaded by the matrix jobs
+      - name: Download all browser test results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: e2e-results-*
+          path: reports/
+          merge-multiple: true
+
+      # Mirrors: sh 'npx nightwatch-html-reporter --report-dir reports/html'
+      - name: Generate consolidated HTML report
+        run: npx nightwatch-html-reporter --report-dir reports/html
+
+      # Mirrors: publishHTML(target: [reportDir: 'reports/html', reportFiles: 'index.html', …])
+      # HTML report is available via the Actions run → Artifacts section.
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-html-report
+          path: reports/html/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # Mirrors: post { always { archiveArtifacts artifacts: 'reports/**/*', allowEmptyArchive: true } }
+      - name: Upload all E2E reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-e2e-reports
+          path: reports/**/*
+          if-no-files-found: warn
+          retention-days: 14
+
+      # -----------------------------------------------------------------------
+      # EXPANDED: vars/notifySlack.groovy — failure notification
+      # Mirrors post { failure { slackSend(channel: '#qa-alerts', color: 'danger', …) } }
+      # notifySlack logic: status=FAILURE → emoji=':x:', color='danger'
+      # Triggered if the generate-report job itself fails OR any browser test job failed.
+      # -----------------------------------------------------------------------
+      - name: Notify Slack — E2E failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.27.0
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_QA_ALERTS }}
+        with:
+          payload: |
+            {
+              "text": ":x: *${{ github.workflow }}* #${{ github.run_number }} - *FAILURE*\nBranch: ${{ github.ref_name }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>\n\nE2E Tests FAILED - ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }

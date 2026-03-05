@@ -1,0 +1,324 @@
+# =============================================================================
+# CI Workflow — migrated from Jenkinsfile
+#
+# Original pipeline: Jenkinsfile (declarative)
+# Agent: docker { image 'node:18-alpine' }
+# Shared libraries expanded inline:
+#   - vars/buildDocker.groovy  → "Docker Build & Push" steps
+#   - vars/notifySlack.groovy  → "Notify Slack" steps
+#
+# SECURITY NOTE: All actions are currently pinned to mutable version tags.
+# Before merging to production, replace every `@vN` reference with a full
+# commit SHA, e.g.:
+#   actions/checkout@v4  →  actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+# Run `gh api repos/<owner>/<repo>/git/ref/tags/<tag>` to obtain each SHA.
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+# Mirrors Jenkins `disableConcurrentBuilds()`.
+# cancel-in-progress: false preserves the semantics of queuing rather than
+# cancelling — change to `true` if you prefer cancelling stale runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# Deny all GITHUB_TOKEN permissions at workflow level; each job grants only what it needs.
+permissions: {}
+
+env:
+  DOCKER_REGISTRY: registry.company.com
+  APP_NAME: web-frontend
+
+# ---------------------------------------------------------------------------
+# Job: lint
+# Mirrors Jenkins stage('Lint')
+# ---------------------------------------------------------------------------
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          # Mirrors Jenkins `NPM_TOKEN = credentials('npm-token')`
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Lint
+        run: npm run lint
+
+  # ---------------------------------------------------------------------------
+  # Job: test
+  # Mirrors Jenkins stage('Unit Tests') + post { always { junit … } }
+  # ---------------------------------------------------------------------------
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Run unit tests with coverage
+        run: npm test -- --coverage
+        env:
+          CI: "true"
+
+      # Mirrors Jenkins `junit 'test-results/**/*.xml'`
+      - name: Upload JUnit test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results/**/*.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Mirrors Jenkins `publishHTML(target: [reportDir: 'coverage/lcov-report', …])`
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/lcov-report/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Job: sonarqube
+  # Mirrors Jenkins stage('SonarQube Analysis') + stage('Quality Gate')
+  # withSonarQubeEnv('SonarQube') → SONAR_TOKEN + SONAR_HOST_URL secrets
+  # waitForQualityGate → sonarqube-quality-gate-action (timeout: 5 min)
+  # ---------------------------------------------------------------------------
+  sonarqube:
+    name: SonarQube Analysis & Quality Gate
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history required for SonarQube blame/new-code detection
+          fetch-depth: 0
+
+      - name: Setup Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Mirrors `withSonarQubeEnv('SonarQube') { sh 'npx sonar-scanner' }`
+      - name: SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+      # Mirrors `waitForQualityGate abortPipeline: true` with timeout(5, MINUTES)
+      - name: SonarQube Quality Gate check
+        uses: SonarSource/sonarqube-quality-gate-action@v1.1.0
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+  # ---------------------------------------------------------------------------
+  # Job: build
+  # Mirrors Jenkins stage('Build') + archiveArtifacts
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Build application
+        run: npm run build
+
+      # Mirrors Jenkins `archiveArtifacts artifacts: 'dist/**/*', fingerprint: true`
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # Job: docker-build-push-and-deploy-staging
+  # Mirrors Jenkins stage('Docker Build & Push') + stage('Deploy to Staging')
+  # Both gated on `when { branch 'main' }`
+  #
+  # EXPANDED from vars/buildDocker.groovy:
+  #   buildDocker(registry, imageName, tag, credentialsId, dockerfile, buildArgs)
+  #   → docker/login-action + docker/build-push-action with :run_number and :latest tags
+  #
+  # EXPANDED from vars/notifySlack.groovy:
+  #   notifySlack(status, channel, message) → slackapi/slack-github-action steps
+  # ---------------------------------------------------------------------------
+  docker-build-push-and-deploy-staging:
+    name: Docker Build, Push & Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [sonarqube, build]
+    # Mirrors Jenkins `when { branch 'main' }`
+    if: github.ref == 'refs/heads/main'
+    timeout-minutes: 30
+    environment: staging
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      # -----------------------------------------------------------------------
+      # EXPANDED: vars/buildDocker.groovy — docker login step
+      # Mirrors:
+      #   withCredentials([usernamePassword(credentialsId: 'docker-registry-creds',
+      #     usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+      #     sh "echo ${DOCKER_PASS} | docker login ${registry} -u ${DOCKER_USER} --password-stdin"
+      #   }
+      # -----------------------------------------------------------------------
+      - name: Log in to Docker Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKER_REGISTRY_USER }}
+          password: ${{ secrets.DOCKER_REGISTRY_PASS }}
+
+      # -----------------------------------------------------------------------
+      # EXPANDED: vars/buildDocker.groovy — build & push step
+      # Mirrors:
+      #   def fullImage   = "${registry}/${imageName}:${tag}"          (run_number)
+      #   def latestImage = "${registry}/${imageName}:latest"
+      #   sh "docker build -t ${fullImage} -t ${latestImage} -f ${dockerfile} ${buildArgsStr} ${context}"
+      #   sh "docker push ${fullImage}"
+      #   sh "docker push ${latestImage}"
+      # build-args from Jenkinsfile inline script: NODE_ENV=production is implicit
+      # via the Dockerfile; no explicit buildArgs were passed in the main Jenkinsfile.
+      # -----------------------------------------------------------------------
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          # Mirrors: fullImage = registry/app:BUILD_NUMBER  AND  latestImage = registry/app:latest
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.APP_NAME }}:${{ github.run_number }}
+            ${{ env.DOCKER_REGISTRY }}/${{ env.APP_NAME }}:latest
+
+      # -----------------------------------------------------------------------
+      # Mirrors Jenkins stage('Deploy to Staging'):
+      #   withCredentials([file(credentialsId: 'kubeconfig-staging', variable: 'KUBECONFIG')]) {
+      #     sh "kubectl set image deployment/..."
+      #     sh "kubectl rollout status ... --timeout=300s"
+      #   }
+      # kubeconfig-staging credential (Jenkins file-type) → KUBECONFIG_STAGING secret
+      # (store the raw kubeconfig file content, base64-encoded, as the secret value)
+      # -----------------------------------------------------------------------
+      - name: Configure kubeconfig for staging
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Deploy to staging
+        run: |
+          kubectl set image deployment/${{ env.APP_NAME }} \
+            ${{ env.APP_NAME }}=${{ env.DOCKER_REGISTRY }}/${{ env.APP_NAME }}:${{ github.run_number }} \
+            -n staging
+          kubectl rollout status deployment/${{ env.APP_NAME }} -n staging --timeout=300s
+
+      # -----------------------------------------------------------------------
+      # EXPANDED: vars/notifySlack.groovy — success notification
+      # Mirrors post { success { slackSend(channel: '#deployments', color: 'good', …) } }
+      # notifySlack logic: status=SUCCESS → color='good', emoji=':white_check_mark:'
+      # defaultMessage template reproduced as GitHub context equivalents
+      # -----------------------------------------------------------------------
+      - name: Notify Slack — success
+        if: success()
+        uses: slackapi/slack-github-action@v1.27.0
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_DEPLOYMENTS }}
+        with:
+          payload: |
+            {
+              "text": ":white_check_mark: *${{ github.workflow }}* #${{ github.run_number }} - *SUCCESS*\nBranch: ${{ github.ref_name }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>\n\nBuild ${{ github.run_number }} succeeded for ${{ env.APP_NAME }}"
+            }
+
+      # -----------------------------------------------------------------------
+      # EXPANDED: vars/notifySlack.groovy — failure notification
+      # Mirrors post { failure { slackSend(channel: '#deployments', color: 'danger', …) } }
+      # notifySlack logic: status=FAILURE → color='danger', emoji=':x:'
+      # -----------------------------------------------------------------------
+      - name: Notify Slack — failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.27.0
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_DEPLOYMENTS }}
+        with:
+          payload: |
+            {
+              "text": ":x: *${{ github.workflow }}* #${{ github.run_number }} - *FAILURE*\nBranch: ${{ github.ref_name }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>\n\nBuild ${{ github.run_number }} FAILED for ${{ env.APP_NAME }}"
+            }
