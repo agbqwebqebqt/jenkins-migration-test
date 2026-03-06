@@ -1,0 +1,268 @@
+##############################################################################
+# E2E Tests Workflow — migrated from nightwatch/Jenkinsfile
+#
+# Original: nightwatch/Jenkinsfile (declarative pipeline, docker agent, parallel browsers)
+# Shared libs expanded inline:
+#   - vars/notifySlack.groovy  → notify-failure job
+#
+# Trigger mapping:
+#   Jenkins: triggers { cron('0 6 * * 1-5') }  (weekdays at 6 AM)
+#   → on: schedule: - cron: '0 6 * * 1-5'
+#
+# Parallel execution mapping:
+#   Jenkins: parallel { stage('Chrome') ... stage('Firefox') ... stage('Safari') ... }
+#   → GitHub Actions: three separate jobs (chrome, firefox, safari) without needs — run in parallel
+#
+# Credential / secret mapping:
+#   browserstack-user   → secrets.BROWSERSTACK_USER
+#   browserstack-key    → secrets.BROWSERSTACK_KEY
+#   Slack webhook       → secrets.SLACK_WEBHOOK_URL
+##############################################################################
+
+name: E2E Tests
+
+on:
+  # Replaces Jenkins: triggers { cron('0 6 * * 1-5') }  — weekdays at 6 AM UTC
+  schedule:
+    - cron: "0 6 * * 1-5"
+  # Allow manual trigger for ad-hoc runs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CI: "true"
+  BASE_URL: https://staging.company.com
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage: Setup (shared install step — node_modules cached for parallel jobs)
+  # Replaces Jenkins: stage('Setup') { sh 'npm ci' }
+  # ---------------------------------------------------------------------------
+  setup:
+    name: Setup
+    runs-on: ubuntu-latest
+    # Replaces Jenkins: agent { docker { image 'node:18-alpine' } }
+    container:
+      image: node:18-alpine
+    timeout-minutes: 45    # Replaces Jenkins: options { timeout(time: 45, unit: 'MINUTES') }
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      # Replaces Jenkins: sh 'npm ci'
+      - name: Install npm dependencies
+        run: npm ci
+
+      # Cache node_modules for parallel browser jobs
+      # actions/upload-artifact v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: e2e-node-modules
+          path: node_modules/
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Stage: E2E Tests — Chrome (parallel branch 1 of 3)
+  # Replaces Jenkins: stage('Chrome') { steps { sh 'npx nightwatch --env chrome --reporter junit' } }
+  # ---------------------------------------------------------------------------
+  e2e-chrome:
+    name: E2E Tests — Chrome
+    runs-on: ubuntu-latest
+    container:
+      image: node:18-alpine
+    timeout-minutes: 45
+    needs: setup
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      # actions/download-artifact v4.2.1
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e
+        with:
+          name: e2e-node-modules
+          path: node_modules/
+
+      # Replaces Jenkins: sh 'npx nightwatch --env chrome --reporter junit'
+      - name: Run Nightwatch Chrome tests
+        run: npx nightwatch --env chrome --reporter junit
+        env:
+          BASE_URL: ${{ env.BASE_URL }}
+          BROWSERSTACK_USER: ${{ secrets.BROWSERSTACK_USER }}
+          BROWSERSTACK_KEY: ${{ secrets.BROWSERSTACK_KEY }}
+
+      # Replaces Jenkins: post { always { junit 'reports/chrome/**/*.xml' } }
+      # actions/upload-artifact v4.6.2
+      - name: Upload Chrome test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: chrome-results
+          path: reports/chrome/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Stage: E2E Tests — Firefox (parallel branch 2 of 3)
+  # Replaces Jenkins: stage('Firefox') { steps { sh 'npx nightwatch --env firefox --reporter junit' } }
+  # ---------------------------------------------------------------------------
+  e2e-firefox:
+    name: E2E Tests — Firefox
+    runs-on: ubuntu-latest
+    container:
+      image: node:18-alpine
+    timeout-minutes: 45
+    needs: setup
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      # actions/download-artifact v4.2.1
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e
+        with:
+          name: e2e-node-modules
+          path: node_modules/
+
+      # Replaces Jenkins: sh 'npx nightwatch --env firefox --reporter junit'
+      - name: Run Nightwatch Firefox tests
+        run: npx nightwatch --env firefox --reporter junit
+        env:
+          BASE_URL: ${{ env.BASE_URL }}
+          BROWSERSTACK_USER: ${{ secrets.BROWSERSTACK_USER }}
+          BROWSERSTACK_KEY: ${{ secrets.BROWSERSTACK_KEY }}
+
+      # Replaces Jenkins: post { always { junit 'reports/firefox/**/*.xml' } }
+      # actions/upload-artifact v4.6.2
+      - name: Upload Firefox test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: firefox-results
+          path: reports/firefox/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Stage: E2E Tests — Safari via BrowserStack (parallel branch 3 of 3)
+  # Replaces Jenkins: stage('Safari') { steps { sh 'npx nightwatch --env safari.browserstack --reporter junit' } }
+  # ---------------------------------------------------------------------------
+  e2e-safari:
+    name: E2E Tests — Safari (BrowserStack)
+    runs-on: ubuntu-latest
+    container:
+      image: node:18-alpine
+    timeout-minutes: 45
+    needs: setup
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      # actions/download-artifact v4.2.1
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e
+        with:
+          name: e2e-node-modules
+          path: node_modules/
+
+      # Replaces Jenkins: sh 'npx nightwatch --env safari.browserstack --reporter junit'
+      - name: Run Nightwatch Safari tests on BrowserStack
+        run: npx nightwatch --env safari.browserstack --reporter junit
+        env:
+          BASE_URL: ${{ env.BASE_URL }}
+          # Replaces Jenkins: BROWSERSTACK_USER = credentials('browserstack-user')
+          #                   BROWSERSTACK_KEY  = credentials('browserstack-key')
+          BROWSERSTACK_USER: ${{ secrets.BROWSERSTACK_USER }}
+          BROWSERSTACK_KEY: ${{ secrets.BROWSERSTACK_KEY }}
+
+      # Replaces Jenkins: post { always { junit 'reports/safari/**/*.xml' } }
+      # actions/upload-artifact v4.6.2
+      - name: Upload Safari test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: safari-results
+          path: reports/safari/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Stage: Generate Report
+  # Replaces Jenkins: stage('Generate Report') { ... publishHTML(...) }
+  # ---------------------------------------------------------------------------
+  generate-report:
+    name: Generate E2E Report
+    runs-on: ubuntu-latest
+    container:
+      image: node:18-alpine
+    timeout-minutes: 45
+    needs: [e2e-chrome, e2e-firefox, e2e-safari]
+    if: always()    # Run even if some browser tests failed (mirrors Jenkins post always)
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      # actions/download-artifact v4.2.1
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e
+        with:
+          name: e2e-node-modules
+          path: node_modules/
+
+      # Download all browser result artifacts
+      # actions/download-artifact v4.2.1
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e
+        with:
+          name: chrome-results
+          path: reports/chrome/
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e
+        with:
+          name: firefox-results
+          path: reports/firefox/
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e
+        with:
+          name: safari-results
+          path: reports/safari/
+
+      # Replaces Jenkins: sh 'npx nightwatch-html-reporter --report-dir reports/html'
+      - name: Generate HTML report
+        run: npx nightwatch-html-reporter --report-dir reports/html
+
+      # Replaces Jenkins: publishHTML(target: [reportDir: 'reports/html', reportFiles: 'index.html', ...])
+      # actions/upload-artifact v4.6.2
+      - name: Upload E2E HTML report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: e2e-html-report
+          path: reports/html/
+          if-no-files-found: ignore
+
+      # Replaces Jenkins: post { always { archiveArtifacts artifacts: 'reports/**/*', allowEmptyArchive: true } }
+      - name: Upload all reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: all-e2e-reports
+          path: reports/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Notification: Failure
+  # Replaces: post { failure { slackSend(channel: '#qa-alerts', ...) } }
+  # Expanded inline from vars/notifySlack.groovy
+  # ---------------------------------------------------------------------------
+  notify-failure:
+    name: Notify Slack — E2E Failure
+    runs-on: ubuntu-latest
+    needs: [e2e-chrome, e2e-firefox, e2e-safari, generate-report]
+    if: failure()
+    steps:
+      # Replaces notifySlack.groovy: status='FAILURE', channel='#qa-alerts'
+      # slackapi/slack-github-action v2.1.0
+      - name: Send Slack failure notification
+        uses: slackapi/slack-github-action@b0fa283ad8fea605de13dc3f449259339835fc52
+        with:
+          payload: |
+            {
+              "channel": "#qa-alerts",
+              "attachments": [
+                {
+                  "color": "danger",
+                  "text": ":x: E2E Tests FAILED\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Build>"
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
