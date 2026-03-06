@@ -1,0 +1,336 @@
+##############################################################################
+# Deploy Workflow — migrated from deploy/Jenkinsfile
+#
+# Original: deploy/Jenkinsfile (declarative pipeline, parameterised, approval gate)
+# Shared libs expanded inline:
+#   - vars/notifySlack.groovy  → notify-* jobs
+#
+# Parameter mapping:
+#   ENVIRONMENT  → inputs.environment (choice: staging | production)
+#   IMAGE_TAG    → inputs.image_tag   (required string)
+#   DRY_RUN      → inputs.dry_run     (boolean)
+#
+# Approval gate mapping:
+#   Jenkins: input(message: ..., submitter: 'ops-team,lead-devs')
+#   → GitHub Actions: environment: production  (with required reviewers)
+#     The 'production' environment must be configured in repository settings
+#     with required reviewers set to the ops-team / lead-devs equivalents.
+#
+# Credential / secret mapping:
+#   kubeconfig-staging    → secrets.KUBECONFIG_STAGING  (env-scoped to staging)
+#   kubeconfig-production → secrets.KUBECONFIG_PRODUCTION (env-scoped to production)
+#   Slack webhook         → secrets.SLACK_WEBHOOK_URL
+##############################################################################
+
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        # Replaces Jenkins: choice(name: 'ENVIRONMENT', choices: ['staging', 'production'])
+        description: Target environment
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      image_tag:
+        # Replaces Jenkins: string(name: 'IMAGE_TAG', defaultValue: '')
+        description: Docker image tag to deploy (required)
+        required: true
+        type: string
+      dry_run:
+        # Replaces Jenkins: booleanParam(name: 'DRY_RUN', defaultValue: false)
+        description: Dry run mode (no actual deployment)
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  deployments: write
+
+env:
+  DOCKER_REGISTRY: registry.company.com
+  APP_NAME: web-frontend
+  SLACK_CHANNEL: "#deployments"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage: Validate Parameters
+  # Replaces Jenkins: stage('Validate Parameters') { script { if (params.IMAGE_TAG == '') { error(...) } } }
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate Parameters
+    runs-on: ubuntu-latest
+    timeout-minutes: 20    # Replaces Jenkins: options { timeout(time: 20, unit: 'MINUTES') }
+    steps:
+      - name: Validate IMAGE_TAG is not empty
+        # Replaces Jenkins: if (params.IMAGE_TAG == '') { error('IMAGE_TAG parameter is required') }
+        run: |
+          if [ -z "${{ inputs.image_tag }}" ]; then
+            echo "::error::image_tag input is required and must not be empty"
+            exit 1
+          fi
+          echo "Deploying ${{ env.APP_NAME }}:${{ inputs.image_tag }} to ${{ inputs.environment }}"
+          echo "Dry run: ${{ inputs.dry_run }}"
+
+  # ---------------------------------------------------------------------------
+  # Stage: Pre-deploy Health Check → Staging
+  # Runs when environment = staging (no approval needed)
+  # Replaces: withCredentials([file(credentialsId: "kubeconfig-staging", ...)])
+  # ---------------------------------------------------------------------------
+  health-check-staging:
+    name: Pre-deploy Health Check (Staging)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: validate
+    if: inputs.environment == 'staging'
+    environment: staging
+    steps:
+      # Replaces Jenkins:
+      #   withCredentials([file(credentialsId: "kubeconfig-${params.ENVIRONMENT}", variable: 'KUBECONFIG')]) {
+      #     sh "kubectl get nodes"
+      #     sh "kubectl get pods -n ${params.ENVIRONMENT} -l app=${APP_NAME}"
+      #   }
+      - name: Run pre-deploy health checks
+        env:
+          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG_STAGING }}
+        run: |
+          echo "$KUBECONFIG_CONTENT" > /tmp/kubeconfig.yaml
+          export KUBECONFIG=/tmp/kubeconfig.yaml
+
+          kubectl get nodes
+          kubectl get pods -n staging -l app=${{ env.APP_NAME }}
+
+          rm -f /tmp/kubeconfig.yaml
+
+  # ---------------------------------------------------------------------------
+  # Stage: Pre-deploy Health Check → Production
+  # Runs when environment = production
+  # The 'production' environment enforces the approval gate.
+  # Replaces Jenkins: stage('Approval') { when { expression { params.ENVIRONMENT == 'production' && !params.DRY_RUN } }
+  #                     input(message: "Deploy ... to PRODUCTION?", submitter: 'ops-team,lead-devs') }
+  # Configure required reviewers in repository Settings → Environments → production
+  # ---------------------------------------------------------------------------
+  health-check-production:
+    name: Pre-deploy Health Check (Production)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: validate
+    # Approval gate: production environment must have required reviewers configured
+    if: inputs.environment == 'production'
+    environment: production
+    steps:
+      # Replaces Jenkins:
+      #   withCredentials([file(credentialsId: "kubeconfig-production", variable: 'KUBECONFIG')]) {
+      #     sh "kubectl get nodes"
+      #     sh "kubectl get pods -n production -l app=${APP_NAME}"
+      #   }
+      - name: Run pre-deploy health checks
+        env:
+          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG_PRODUCTION }}
+        run: |
+          echo "$KUBECONFIG_CONTENT" > /tmp/kubeconfig.yaml
+          export KUBECONFIG=/tmp/kubeconfig.yaml
+
+          kubectl get nodes
+          kubectl get pods -n production -l app=${{ env.APP_NAME }}
+
+          rm -f /tmp/kubeconfig.yaml
+
+  # ---------------------------------------------------------------------------
+  # Stage: Deploy → Staging
+  # Replaces Jenkins: stage('Deploy') when environment = staging
+  # Includes dry-run support
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy (Staging)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: health-check-staging
+    if: inputs.environment == 'staging'
+    environment: staging
+    steps:
+      - name: Deploy to staging
+        # Replaces Jenkins:
+        #   if (params.DRY_RUN) { echo "DRY RUN: Would deploy ..." }
+        #   else { withCredentials([file(...)]) { kubectl set image ...; kubectl rollout status ... } }
+        env:
+          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG_STAGING }}
+        run: |
+          IMAGE="${{ env.DOCKER_REGISTRY }}/${{ env.APP_NAME }}:${{ inputs.image_tag }}"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "DRY RUN: Would deploy ${IMAGE} to staging"
+          else
+            echo "$KUBECONFIG_CONTENT" > /tmp/kubeconfig.yaml
+            export KUBECONFIG=/tmp/kubeconfig.yaml
+
+            kubectl set image deployment/${{ env.APP_NAME }} \
+              ${{ env.APP_NAME }}=${IMAGE} \
+              -n staging
+
+            kubectl rollout status deployment/${{ env.APP_NAME }} \
+              -n staging --timeout=300s
+
+            rm -f /tmp/kubeconfig.yaml
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Stage: Deploy → Production
+  # Replaces Jenkins: stage('Deploy') when environment = production
+  # ---------------------------------------------------------------------------
+  deploy-production:
+    name: Deploy (Production)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: health-check-production
+    if: inputs.environment == 'production'
+    environment: production
+    steps:
+      - name: Deploy to production
+        env:
+          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG_PRODUCTION }}
+        run: |
+          IMAGE="${{ env.DOCKER_REGISTRY }}/${{ env.APP_NAME }}:${{ inputs.image_tag }}"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "DRY RUN: Would deploy ${IMAGE} to production"
+          else
+            echo "$KUBECONFIG_CONTENT" > /tmp/kubeconfig.yaml
+            export KUBECONFIG=/tmp/kubeconfig.yaml
+
+            kubectl set image deployment/${{ env.APP_NAME }} \
+              ${{ env.APP_NAME }}=${IMAGE} \
+              -n production
+
+            kubectl rollout status deployment/${{ env.APP_NAME }} \
+              -n production --timeout=300s
+
+            rm -f /tmp/kubeconfig.yaml
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Stage: Post-deploy Verification + Smoke Tests → Staging
+  # Replaces Jenkins: stage('Post-deploy Verification') and stage('Smoke Tests')
+  #   when { expression { !params.DRY_RUN } }
+  # ---------------------------------------------------------------------------
+  verify-staging:
+    name: Post-deploy Verification & Smoke Tests (Staging)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: deploy-staging
+    if: inputs.environment == 'staging' && inputs.dry_run == false
+    environment: staging
+    steps:
+      # Replaces Jenkins:
+      #   withCredentials([file(...)]) {
+      #     sh "kubectl get pods -n staging -l app=${APP_NAME}"
+      #     sh "kubectl exec ... -- curl -sf http://localhost:3000/health || exit 1"
+      #   }
+      - name: Kubernetes pod verification
+        env:
+          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG_STAGING }}
+        run: |
+          echo "$KUBECONFIG_CONTENT" > /tmp/kubeconfig.yaml
+          export KUBECONFIG=/tmp/kubeconfig.yaml
+
+          kubectl get pods -n staging -l app=${{ env.APP_NAME }}
+          kubectl exec -n staging deploy/${{ env.APP_NAME }} -- \
+            curl -sf http://localhost:3000/health || exit 1
+
+          rm -f /tmp/kubeconfig.yaml
+
+      # Replaces Jenkins: stage('Smoke Tests') { sh "curl -sf https://staging.company.com/..." }
+      - name: Smoke tests
+        run: |
+          curl -sf https://staging.company.com/api/health || exit 1
+          curl -sf https://staging.company.com/ | grep -q 'Web Frontend'
+
+  # ---------------------------------------------------------------------------
+  # Stage: Post-deploy Verification + Smoke Tests → Production
+  # ---------------------------------------------------------------------------
+  verify-production:
+    name: Post-deploy Verification & Smoke Tests (Production)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: deploy-production
+    if: inputs.environment == 'production' && inputs.dry_run == false
+    environment: production
+    steps:
+      - name: Kubernetes pod verification
+        env:
+          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG_PRODUCTION }}
+        run: |
+          echo "$KUBECONFIG_CONTENT" > /tmp/kubeconfig.yaml
+          export KUBECONFIG=/tmp/kubeconfig.yaml
+
+          kubectl get pods -n production -l app=${{ env.APP_NAME }}
+          kubectl exec -n production deploy/${{ env.APP_NAME }} -- \
+            curl -sf http://localhost:3000/health || exit 1
+
+          rm -f /tmp/kubeconfig.yaml
+
+      - name: Smoke tests
+        run: |
+          curl -sf https://production.company.com/api/health || exit 1
+          curl -sf https://production.company.com/ | grep -q 'Web Frontend'
+
+  # ---------------------------------------------------------------------------
+  # Notification: Success
+  # Replaces: post { success { slackSend(...) } }
+  # Expanded inline from vars/notifySlack.groovy
+  # ---------------------------------------------------------------------------
+  notify-success:
+    name: Notify Slack — Success
+    runs-on: ubuntu-latest
+    needs: [verify-staging, verify-production, deploy-staging, deploy-production]
+    if: success()
+    steps:
+      # Replaces notifySlack.groovy logic: color='good', emoji=':white_check_mark:'
+      # slackapi/slack-github-action v2.1.0
+      - name: Send Slack success notification
+        uses: slackapi/slack-github-action@b0fa283ad8fea605de13dc3f449259339835fc52
+        with:
+          payload: |
+            {
+              "channel": "${{ env.SLACK_CHANNEL }}",
+              "attachments": [
+                {
+                  "color": "good",
+                  "text": ":white_check_mark: Deployed ${{ env.APP_NAME }}:${{ inputs.image_tag }} to ${{ inputs.environment }} successfully\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # ---------------------------------------------------------------------------
+  # Notification: Failure
+  # Replaces: post { failure { slackSend(...) } }
+  # Expanded inline from vars/notifySlack.groovy
+  # ---------------------------------------------------------------------------
+  notify-failure:
+    name: Notify Slack — Failure
+    runs-on: ubuntu-latest
+    needs: [validate, health-check-staging, health-check-production, deploy-staging, deploy-production, verify-staging, verify-production]
+    if: failure()
+    steps:
+      # slackapi/slack-github-action v2.1.0
+      - name: Send Slack failure notification
+        uses: slackapi/slack-github-action@b0fa283ad8fea605de13dc3f449259339835fc52
+        with:
+          payload: |
+            {
+              "channel": "${{ env.SLACK_CHANNEL }}",
+              "attachments": [
+                {
+                  "color": "danger",
+                  "text": ":x: FAILED to deploy ${{ env.APP_NAME }}:${{ inputs.image_tag }} to ${{ inputs.environment }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
